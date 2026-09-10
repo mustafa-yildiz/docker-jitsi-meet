@@ -1,55 +1,85 @@
-ARG JITSI_REPO=jitsi
-FROM ${JITSI_REPO}/base
+ARG JITSI_REPO=ghcr.io/jitsi
+ARG BASE_TAG=latest
 
-ADD https://prosody.im/files/prosody-debian-packages.key /tmp/prosody.key
+FROM ${JITSI_REPO}/base:${BASE_TAG} AS builder
 
-RUN \
-    apt-key add /tmp/prosody.key \
-    && rm -f /tmp/prosody.key \
-    && echo "deb http://packages.prosody.im/debian stretch main" > /etc/apt/sources.list.d/prosody.list \
-    && apt-dpkg-wrap apt-get update \
-    && apt-dpkg-wrap apt-get install -t stretch-backports -y \
-      prosody \
-      liblua5.2-dev \
-      sasl2-bin \
-      libsasl2-modules-ldap \
-      libsasl2-dev \
-      libssl1.0-dev \
-      lua-basexx \
-      lua-ldap \
-      lua-sec \
-      luarocks \
+USER root
+
+RUN apt-dpkg-wrap apt-get update && \
+    apt-dpkg-wrap apt-get install -y \
+      build-essential \
+      lua5.4 \
+      liblua5.4-dev \
+      libreadline-dev \
       git \
-      gcc \
-      patch \
-    && luarocks install cyrussasl 1.1.0-1 \
-    && luarocks install lua-cjson 2.1.0-1 \
-    && luarocks install luajwtjitsi 1.3-7 \
-    && luarocks install net-url 0.9-1 \
-    && apt-dpkg-wrap apt-get remove -t stretch-backports -y \
-      git \
-      gcc \
-      luarocks \
-      libsasl2-dev \
-      libssl1.0-dev \
-      liblua5.2-dev \
-    && apt-cleanup \
-    && rm -rf /etc/prosody /var/cache/apt
+      unzip \
+      wget && \
+    mkdir /tmp/luarocks && \
+    wget -qO - https://luarocks.github.io/luarocks/releases/luarocks-3.8.0.tar.gz | tar xfz - --strip-components 1 -C /tmp/luarocks && \
+    cd /tmp/luarocks && ./configure && make && make install && cd - && \
+    luarocks install basexx 0.4.1-1 && \
+    luarocks install lua-cjson 2.1.0-1 && \
+    luarocks install net-url 0.9-1
 
-RUN \
-    apt-dpkg-wrap apt-get update \
-    && apt-dpkg-wrap apt-get -d install -y jitsi-meet-tokens \
-    && dpkg -x /var/cache/apt/archives/jitsi-meet-tokens*.deb /tmp \
-    && mv /tmp/usr/share/jitsi-meet/prosody-plugins /prosody-plugins \
-    && apt-cleanup \
-    && rm -rf /tmp/usr /var/cache/apt
+FROM ${JITSI_REPO}/base:${BASE_TAG}
 
-RUN \
-    sed -i s/hook/hook_global/g /prosody-plugins/mod_auth_token.lua \
-    && patch -d /usr/lib/prosody/modules/muc -p0 < /prosody-plugins/muc_owner_allow_kick.patch
+USER root
+
+LABEL org.opencontainers.image.title="Prosody IM"
+LABEL org.opencontainers.image.description="XMPP server used for signalling."
+LABEL org.opencontainers.image.url="https://prosody.im/"
+LABEL org.opencontainers.image.source="https://github.com/jitsi/docker-jitsi-meet"
+LABEL org.opencontainers.image.documentation="https://jitsi.github.io/handbook/"
+
+ARG VERSION_MATRIX_USER_VERIFICATION_SERVICE_PLUGIN="1.8.0"
+ARG PROSODY_PACKAGE="prosody"
+ARG PROSODY_PACKAGE_VERSION="13.*"
 
 COPY rootfs/ /
 
-EXPOSE 5222 5269 5347 5280
+RUN set -x && \
+    wget -qO - https://prosody.im/files/prosody-debian-packages.key | \
+      gpg --dearmour > /usr/share/keyrings/prosody.gpg && \
+    apt-dpkg-wrap apt-get update && \
+    apt-dpkg-wrap apt-get install -y \
+      lua5.4 \
+      $PROSODY_PACKAGE=$PROSODY_PACKAGE_VERSION \
+      libldap-common \
+      sasl2-bin \
+      libsasl2-modules-ldap \
+      lua-cyrussasl \
+      lua-inspect \
+      lua-ldap \
+      lua-luaossl \
+      lua-sec \
+      lua-unbound && \
+    apt-dpkg-wrap apt-get -d install -y jitsi-meet-prosody && \
+    dpkg -x /var/cache/apt/archives/jitsi-meet-prosody*.deb /tmp/pkg && \
+    cp -a /tmp/pkg/usr/share/jitsi-meet/prosody-plugins/* /prosody-plugins && \
+    rm -rf /tmp/pkg /var/cache/apt && \
+    apt-cleanup && \
+    rm -rf /etc/prosody && \
+    mv /usr/share/lua/5.3/inspect.lua /usr/share/lua/5.4/ && \
+    wget https://github.com/matrix-org/prosody-mod-auth-matrix-user-verification/archive/refs/tags/v$VERSION_MATRIX_USER_VERIFICATION_SERVICE_PLUGIN.tar.gz && \
+    tar -xf v$VERSION_MATRIX_USER_VERIFICATION_SERVICE_PLUGIN.tar.gz && \
+    mv prosody-mod-auth-matrix-user-verification-$VERSION_MATRIX_USER_VERIFICATION_SERVICE_PLUGIN/mod_auth_matrix_user_verification.lua /prosody-plugins && \
+    mv prosody-mod-auth-matrix-user-verification-$VERSION_MATRIX_USER_VERIFICATION_SERVICE_PLUGIN/mod_matrix_power_sync.lua /prosody-plugins && \
+    rm -rf prosody-mod-auth-matrix-user-verification-$VERSION_MATRIX_USER_VERIFICATION_SERVICE_PLUGIN v$VERSION_MATRIX_USER_VERIFICATION_SERVICE_PLUGIN.tar.gz && \
+    VERSION_PROSODY_CONTRIB_PLUGINS=$(wget -q -O - https://api.github.com/repos/jitsi-contrib/prosody-plugins/tags | grep -m 1 '"name":' | cut -d '"' -f4) && \
+    wget -q https://github.com/jitsi-contrib/prosody-plugins/archive/refs/tags/$VERSION_PROSODY_CONTRIB_PLUGINS.tar.gz && \
+    mkdir /prosody-plugins-contrib && \
+    tar --strip-components=1 -C /prosody-plugins-contrib -xf $VERSION_PROSODY_CONTRIB_PLUGINS.tar.gz && \
+    rm -f $VERSION_PROSODY_CONTRIB_PLUGINS.tar.gz && \
+    (apt-cache policy prosody | grep Installed | grep -Eq " 13\." && sed -i '/idna_to_ascii/d' /usr/share/lua/5.4/prosody/util/jid.lua || true) && \
+    usermod -a -G prosody,sasl s6 && \
+    chown s6:s6 /var/lib/prosody /var/run/saslauthd && \
+    echo "TLS_REQCERT allow" >> /etc/ldap/ldap.conf
+
+COPY --from=builder /usr/local/lib/lua/5.4 /usr/local/lib/lua/5.4
+COPY --from=builder /usr/local/share/lua/5.4 /usr/local/share/lua/5.4
+
+EXPOSE 5222 5280
 
 VOLUME ["/config", "/prosody-plugins-custom"]
+
+USER s6
